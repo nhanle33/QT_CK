@@ -2,6 +2,7 @@
 PROBABILISTIC FORECASTING FOR TRADING DECISIONS
 Method: LightGBM + Isotonic Calibration (Probabilistic Classification)
 """
+from joblib import compressor
 from sklearn.metrics import accuracy_score
 import warnings; warnings.filterwarnings('ignore')
 import sys, io
@@ -19,6 +20,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import lightgbm as lgb
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
@@ -180,7 +183,9 @@ def train(df, X, y, feat):
                   index=vc.index)
     sr=(1+sig.shift(1).fillna(0)*dr).cumprod()
     mr=(1+dr).cumprod()
-    sharpe=dr[sig.shift(1)!=0].mean()/(dr[sig.shift(1)!=0].std()+1e-9)*np.sqrt(252)
+    # sharpe=dr[sig.shift(1)!=0].mean()/(dr[sig.shift(1)!=0].std()+1e-9)*np.sqrt(252)
+    strategy_returns = sig.shift(1).fillna(0) * dr
+    sharpe = strategy_returns.mean() / (strategy_returns.std() + 1e-9) * np.sqrt(252)
     dd=(sr/sr.cummax()-1).min()
 
     print(f"{'='*50}")
@@ -192,9 +197,159 @@ def train(df, X, y, feat):
     print(f"  Max Drawdown    : {dd*100:.2f}%")
     print(f"{'='*50}\n")
 
+    # So sánh với các phương pháp khác
+    compare_methods(
+        X_tr_sc, y_tr, X_val_sc, y_val,
+        close_val=df['Close'].iloc[val_idx],
+        main_prob=prob,
+        main_auc=auc, main_acc=acc, main_brier=brier, main_ll=ll,
+        main_sharpe=sharpe,
+        main_strat_ret=(sr.iloc[-1]-1)*100,
+        main_mkt_ret=(mr.iloc[-1]-1)*100,
+        main_maxdd=dd*100,
+    )
+
     joblib.dump(model, MODEL_FILE); joblib.dump(scaler, SCALER_FILE)
     print(f"[+] Saved {MODEL_FILE}, {SCALER_FILE}")
     return model, scaler, prob, val_idx, sig
+
+# ── METHOD COMPARISON ───────────────────────────────────────────────────────
+def compare_methods(X_tr_sc, y_tr, X_val_sc, y_val,
+                    close_val,
+                    main_prob, main_auc, main_acc, main_brier,
+                    main_ll, main_sharpe, main_strat_ret,
+                    main_mkt_ret, main_maxdd):
+    """
+    Huấn luyện 2 phương pháp baseline, tính metrics và in bảng so sánh đẹp.
+    Phương pháp:
+      1. LightGBM + Isotonic Calibration  (phương pháp đề xuất — đã huấn luyện)
+      2. Quantile Regression proxy        (Gradient Boosting + Platt Scaling)
+      3. Logistic Regression              + Hiệu chỉnh xác suất (Isotonic)
+    """
+    def _backtest(prob, close):
+        dr  = close.pct_change().fillna(0)
+        sig = pd.Series(
+            np.where(prob >= THRESHOLD_BUY, 1,
+                     np.where(prob <= THRESHOLD_SELL, -1, 0)),
+            index=close.index
+        )
+        strat = sig.shift(1).fillna(0) * dr
+        cum   = (1 + strat).cumprod()
+        mkt   = (1 + dr).cumprod()
+        return {
+            'sharpe'   : strat.mean() / (strat.std() + 1e-9) * np.sqrt(252),
+            'strat_ret': (cum.iloc[-1]  - 1) * 100,
+            'mkt_ret'  : (mkt.iloc[-1]  - 1) * 100,
+            'maxdd'    : (cum / cum.cummax() - 1).min() * 100,
+        }
+
+    def _eval(model):
+        model.fit(X_tr_sc, y_tr)
+        prob = model.predict_proba(X_val_sc)[:, 1]
+        pred = (prob >= 0.5).astype(int)
+        bt   = _backtest(prob, close_val)
+        return {
+            'auc'      : roc_auc_score(y_val, prob),
+            'acc'      : accuracy_score(y_val, pred),
+            'brier'    : brier_score_loss(y_val, prob),
+            'll'       : log_loss(y_val, prob),
+            'sharpe'   : bt['sharpe'],
+            'strat_ret': bt['strat_ret'],
+            'mkt_ret'  : bt['mkt_ret'],
+            'maxdd'    : bt['maxdd'],
+        }
+
+    # Phương pháp 2: Quantile Regression proxy
+    print("[*] Comparing — Quantile Regression (GradBoost + Platt Scaling) ...")
+    r2 = _eval(CalibratedClassifierCV(
+        GradientBoostingClassifier(
+            n_estimators=300, learning_rate=0.05, max_depth=4,
+            subsample=0.8, min_samples_leaf=20, random_state=42
+        ), method='sigmoid', cv=3
+    ))
+
+    # Phương pháp 3: Logistic Regression + Isotonic Calibration
+    print("[*] Comparing — Logistic Regression + Hiệu chỉnh xác suất (Isotonic) ...")
+    r3 = _eval(CalibratedClassifierCV(
+        LogisticRegression(
+            max_iter=2000, class_weight='balanced',
+            C=0.5, solver='lbfgs', random_state=42
+        ), method='isotonic', cv=3
+    ))
+
+    # Kết quả phương pháp đề xuất (đã tính sẵn từ train())
+    r1 = {
+        'auc': main_auc, 'acc': main_acc, 'brier': main_brier, 'll': main_ll,
+        'sharpe': main_sharpe, 'strat_ret': main_strat_ret,
+        'mkt_ret': main_mkt_ret, 'maxdd': main_maxdd,
+    }
+
+    methods = [
+        ("LightGBM + Isotonic Cal. (Đề xuất)", r1),
+        ("Quantile Regression + Platt Scaling", r2),
+        ("Logistic Reg. + Isotonic Cal.",       r3),
+    ]
+
+    # ── Xác định chỉ số tốt nhất ─────────────────────────────────────────────
+    keys_higher = ['auc', 'acc', 'sharpe', 'strat_ret']
+    keys_lower  = ['brier', 'll', 'maxdd']   # maxdd âm → cao hơn = tốt hơn
+
+    def is_best(key, val, all_res):
+        vals = [r[key] for _, r in all_res]
+        return abs(val - (max(vals) if key in keys_higher else min(vals))) < 1e-9
+
+    # ── In bảng rich ──────────────────────────────────────────────────────────
+    console.print()
+    console.rule("[bold cyan]SO SÁNH PHƯƠNG PHÁP  ·  Method Comparison[/bold cyan]")
+
+    tbl = Table(
+        title="So sánh LightGBM + Isotonic  vs  Quantile Regression  vs  Logistic Regression",
+        box=box.DOUBLE_EDGE,
+        title_style="bold cyan",
+        show_header=True,
+        header_style="bold magenta",
+        border_style="dim",
+    )
+    tbl.add_column("Chỉ số",                     style="dim",       width=22)
+    tbl.add_column("LightGBM\n+ Isotonic",       justify="center",  width=18)
+    tbl.add_column("Quantile Reg.\n+ Platt",     justify="center",  width=18)
+    tbl.add_column("Logistic Reg.\n+ Isotonic",  justify="center",  width=18)
+    tbl.add_column("Tốt hơn nếu",               justify="center",  width=14, style="dim")
+
+    def cell(key, val, fmt, higher_is_better=True):
+        best = is_best(key, val, methods)
+        color = "green" if best else "white"
+        star  = "★ " if best else "  "
+        return f"[{color}]{star}{fmt.format(val)}[/{color}]"
+
+    rows = [
+        ("ROC-AUC",        "auc",       "{:.4f}",  True,  "↑ Cao hơn"),
+        ("Accuracy",       "acc",       "{:.2%}",   True,  "↑ Cao hơn"),
+        ("Brier Score",    "brier",     "{:.4f}",  False, "↓ Thấp hơn"),
+        ("Log Loss",       "ll",        "{:.4f}",  False, "↓ Thấp hơn"),
+        ("Sharpe Ratio",   "sharpe",    "{:.3f}",  True,  "↑ Cao hơn"),
+        ("Strategy Return","strat_ret", "{:+.2f}%", True, "↑ Cao hơn"),
+        ("Market Return",  "mkt_ret",   "{:+.2f}%", True, "(tham khảo)"),
+        ("Max Drawdown",   "maxdd",     "{:+.2f}%", True, "↑ Gần 0"),
+    ]
+
+    for label, key, fmt, higher, direction in rows:
+        tbl.add_row(
+            label,
+            cell(key, r1[key], fmt, higher),
+            cell(key, r2[key], fmt, higher),
+            cell(key, r3[key], fmt, higher),
+            direction,
+        )
+
+    console.print(tbl)
+    console.print(
+        "  [dim]★ = Tốt nhất trong nhóm  ·  "
+        "Baseline: random ROC-AUC=0.50 | Brier=0.25 | LogLoss=0.693[/dim]"
+    )
+    console.rule(style="dim")
+    console.print()
+
 
 # ── PREDICT ──────────────────────────────────────────────────────────────────
 def predict(df, feat, model, scaler):
@@ -453,7 +608,8 @@ def main(retrain=True):
         sig2=pd.Series(np.where(prob2>=THRESHOLD_BUY,1,np.where(prob2<=THRESHOLD_SELL,-1,0)),index=vc2.index)
         sr2=(1+sig2.shift(1).fillna(0)*dr2).cumprod()
         mr2=(1+dr2).cumprod()
-        sharpe2=dr2[sig2.shift(1)!=0].mean()/(dr2[sig2.shift(1)!=0].std()+1e-9)*np.sqrt(252)
+        strat_returns2 = sig2.shift(1).fillna(0) * dr2
+        sharpe2 = strat_returns2.mean() / (strat_returns2.std() + 1e-9) * np.sqrt(252)
         dd2=(sr2/sr2.cummax()-1).min()
         strat_ret=(sr2.iloc[-1]-1)*100; mkt_ret=(mr2.iloc[-1]-1)*100
         sharpe=sharpe2; maxdd=dd2*100
