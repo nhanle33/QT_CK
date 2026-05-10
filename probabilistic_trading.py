@@ -198,7 +198,7 @@ def train(df, X, y, feat):
     print(f"{'='*50}\n")
 
     # So sánh với các phương pháp khác
-    compare_methods(
+    comparison_data = compare_methods(
         X_tr_sc, y_tr, X_val_sc, y_val,
         close_val=df['Close'].iloc[val_idx],
         main_prob=prob,
@@ -211,7 +211,7 @@ def train(df, X, y, feat):
 
     joblib.dump(model, MODEL_FILE); joblib.dump(scaler, SCALER_FILE)
     print(f"[+] Saved {MODEL_FILE}, {SCALER_FILE}")
-    return model, scaler, prob, val_idx, sig
+    return model, scaler, prob, val_idx, sig, comparison_data
 
 # ── METHOD COMPARISON ───────────────────────────────────────────────────────
 def compare_methods(X_tr_sc, y_tr, X_val_sc, y_val,
@@ -349,6 +349,192 @@ def compare_methods(X_tr_sc, y_tr, X_val_sc, y_val,
     )
     console.rule(style="dim")
     console.print()
+
+    # Trả về dict để vẽ biểu đồ
+    return {
+        'methods': [name for name, _ in methods],
+        'results': [res  for _, res  in methods],
+    }
+
+
+# ── COMPARISON CHART ─────────────────────────────────────────────────────────
+def plot_comparison(comparison_data):
+    """
+    Vẽ biểu đồ cột so sánh các chỉ số giữa 3 phương pháp.
+    Lưu ra file method_comparison.png
+    """
+    if comparison_data is None:
+        return
+
+    DK='#0d1117'; PN='#161b22'; EG='#30363d'
+    BL='#58a6ff'; OR='#f0883e'; PU='#bc8cff'
+    GR='#3fb950'; RD='#f85149'; GY='#8b949e'; WH='#e6edf3'
+    COLORS = [BL, OR, PU]          # màu cho mỗi phương pháp
+    STAR   = '★ '
+
+    method_names = comparison_data['methods']
+    results      = comparison_data['results']
+
+    # Nhãn ngắn gọn hơn cho trục X
+    short_names = [
+        'LightGBM\n+ Isotonic',
+        'Quantile Reg.\n+ Platt',
+        'Logistic Reg.\n+ Isotonic',
+    ]
+
+    # ── Các panel cần vẽ ────────────────────────────────────────────────────
+    panels = [
+        # (title, key, higher_is_better, unit, y_label)
+        ('ROC-AUC',        'auc',       True,  '',   'AUC'),
+        ('Accuracy',       'acc',       True,  '%',  'Accuracy (%)'),
+        ('Brier Score',    'brier',     False, '',   'Score (↓ better)'),
+        ('Log Loss',       'll',        False, '',   'Loss (↓ better)'),
+        ('Sharpe Ratio',   'sharpe',    True,  '',   'Sharpe'),
+        ('Strategy Return','strat_ret', True,  '%',  'Return (%)'),
+        ('Max Drawdown',   'maxdd',     True,  '%',  'Drawdown (%)'),
+    ]
+
+    ncols = 4
+    nrows = 2
+    fig, axes = plt.subplots(nrows, ncols, figsize=(20, 10), facecolor=DK)
+    fig.suptitle(
+        'So Sánh Phương Pháp  ·  Method Comparison',
+        fontsize=16, fontweight='bold', color=WH, y=1.01
+    )
+    fig.patch.set_facecolor(DK)
+
+    axes_flat = axes.flatten()
+
+    x = np.arange(len(short_names))
+    bar_w = 0.55
+
+    for idx, (title, key, higher, unit, ylabel) in enumerate(panels):
+        ax = axes_flat[idx]
+        ax.set_facecolor(PN)
+        for sp in ax.spines.values():
+            sp.set_edgecolor(EG)
+        ax.tick_params(colors=GY, labelsize=8)
+
+        vals = [r[key] for r in results]
+        best_val = max(vals) if higher else min(vals)
+
+        # Chuyển acc sang %
+        display_vals = [v * 100 if key == 'acc' else v for v in vals]
+        display_best = best_val * 100 if key == 'acc' else best_val
+
+        bar_colors = []
+        for v in vals:
+            if abs(v - best_val) < 1e-9:
+                bar_colors.append(GR)
+            else:
+                bar_colors.append(GY)
+
+        bars = ax.bar(x, display_vals, width=bar_w, color=bar_colors,
+                      edgecolor=EG, linewidth=0.8, zorder=3)
+
+        # Đường baseline tham khảo
+        baselines = {
+            'auc': (0.50, 'Random'),
+            'brier': (0.25, 'Random'),
+            'll': (0.693, 'Random'),
+            'sharpe': (1.0, 'Good≥1'),
+        }
+        if key in baselines:
+            bv, blabel = baselines[key]
+            if key == 'acc':
+                bv *= 100
+            ax.axhline(bv, color=RD, ls='--', lw=1.0, alpha=0.8, zorder=2)
+            ax.text(len(short_names) - 0.5, bv * 1.01, blabel,
+                    color=RD, fontsize=7, va='bottom', ha='right')
+
+        # Giá trị trên mỗi cột
+        for bar, dv, orig_v, base_c in zip(bars, display_vals, vals, bar_colors):
+            label_text = f'{dv:.2f}{unit}'
+            if key == 'acc':
+                label_text = f'{orig_v:.1%}'
+            elif key in ('strat_ret', 'maxdd'):
+                label_text = f'{dv:+.1f}%'
+            is_best = abs(orig_v - best_val) < 1e-9
+            txt_color = GR if is_best else WH
+            prefix = STAR if is_best else ''
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + (0.003 if dv >= 0 else -0.02) * abs(max(display_vals, key=abs) or 1),
+                f'{prefix}{label_text}',
+                ha='center', va='bottom' if dv >= 0 else 'top',
+                color=txt_color, fontsize=8, fontweight='bold'
+            )
+
+        ax.set_title(title, color=WH, fontsize=10, pad=6)
+        ax.set_ylabel(ylabel, color=GY, fontsize=8)
+        ax.set_xticks(x)
+        ax.set_xticklabels(short_names, color=GY, fontsize=7.5)
+        ax.yaxis.grid(True, color=EG, linewidth=0.6, alpha=0.6)
+        ax.set_axisbelow(True)
+
+    # Panel cuối: radar / spider chart tổng hợp
+    ax_radar = axes_flat[len(panels)]
+    ax_radar.set_facecolor(PN)
+    for sp in ax_radar.spines.values():
+        sp.set_edgecolor(EG)
+
+    radar_keys   = ['auc', 'acc', 'sharpe']
+    radar_labels = ['ROC-AUC', 'Accuracy', 'Sharpe']
+
+    # Chuẩn hoá 0-1 cho mỗi chỉ số
+    def normalise(vals_list, higher=True):
+        mn, mx = min(vals_list), max(vals_list)
+        if mx - mn < 1e-9:
+            return [0.5] * len(vals_list)
+        normed = [(v - mn) / (mx - mn) for v in vals_list]
+        return normed if higher else [1 - n for n in normed]
+
+    norm_data = []
+    for rk in radar_keys:
+        raw = [r[rk] for r in results]
+        norm_data.append(normalise(raw, higher=True))
+
+    # Bar-group chart thay radar vì matplotlib radar khó đọc
+    ax_radar.set_title('Tổng hợp (chuẩn hoá)', color=WH, fontsize=10, pad=6)
+    n_metrics = len(radar_keys)
+    grp_w = 0.22
+    offsets = np.linspace(-(n_metrics - 1) * grp_w / 2,
+                          (n_metrics - 1) * grp_w / 2, n_metrics)
+    legend_handles = []
+    for mi, (m_name, m_color, m_norm) in enumerate(
+            zip(short_names, COLORS, zip(*norm_data))):
+        positions = x + offsets[mi]
+        b = ax_radar.bar(positions, list(m_norm), width=grp_w * 0.85,
+                         color=m_color, edgecolor=EG, linewidth=0.6,
+                         label=m_name.replace('\n', ' '), alpha=0.85)
+        legend_handles.append(b)
+
+    ax_radar.set_xticks(x)
+    ax_radar.set_xticklabels(radar_labels, color=GY, fontsize=8)
+    ax_radar.set_ylabel('Normalised score', color=GY, fontsize=8)
+    ax_radar.set_ylim(0, 1.15)
+    ax_radar.yaxis.grid(True, color=EG, linewidth=0.6, alpha=0.6)
+    ax_radar.set_axisbelow(True)
+    ax_radar.tick_params(colors=GY, labelsize=8)
+    ax_radar.legend(facecolor=PN, labelcolor=WH, fontsize=7, loc='upper right')
+
+    # Ẩn ô thừa nếu có
+    for i in range(len(panels) + 1, len(axes_flat)):
+        axes_flat[i].set_visible(False)
+
+    # Chú thích chung
+    fig.text(
+        0.5, -0.01,
+        '★ = Tốt nhất trong nhóm  ·  Cột xanh lá = giá trị tốt nhất  ·  '
+        'Baseline: ROC-AUC 0.50 | Brier 0.25 | LogLoss 0.693',
+        ha='center', color=GY, fontsize=8
+    )
+
+    plt.tight_layout(pad=2.0)
+    out = 'method_comparison.png'
+    plt.savefig(out, dpi=150, bbox_inches='tight', facecolor=DK)
+    print(f'[+] Comparison chart saved -> {out}')
+    plt.close(fig)
 
 
 # ── PREDICT ──────────────────────────────────────────────────────────────────
@@ -491,7 +677,7 @@ def print_report(df, feat, p_up, p_dn, dec, tag, dec_color, conf, today, nday,
     console.rule(style="dim")
 
 # ── DASHBOARD ────────────────────────────────────────────────────────────────
-def plot(df, p_up, p_dn, dec, feat, val_prob=None, val_idx=None, val_sig=None):
+def plot(df, p_up, p_dn, dec, feat, val_prob=None, val_idx=None, val_sig=None, comparison_data=None):
     DK='#0d1117'; PN='#161b22'; EG='#30363d'
     BL='#58a6ff'; OR='#f0883e'; PU='#bc8cff'
     GR='#3fb950'; RD='#f85149'; GY='#8b949e'; WH='#e6edf3'
@@ -583,11 +769,15 @@ def plot(df, p_up, p_dn, dec, feat, val_prob=None, val_idx=None, val_sig=None):
     print("[+] Dashboard saved -> trading_dashboard.png")
     plt.close(fig) # Dong figure giai phong bo nho
 
+    # Vẽ biểu đồ so sánh phương pháp
+    plot_comparison(comparison_data)
+
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 def main(retrain=True):
     df,X,y,feat=load_data()
+    comparison_data = None
     if retrain or not os.path.exists(MODEL_FILE):
-        model,scaler,vp,vi,vs=train(df,X,y,feat)
+        model,scaler,vp,vi,vs,comparison_data=train(df,X,y,feat)
         # luu lai metrics de in
         from sklearn.metrics import roc_auc_score,brier_score_loss,log_loss,accuracy_score
         from sklearn.calibration import CalibratedClassifierCV
@@ -621,7 +811,7 @@ def main(retrain=True):
     p_up,p_dn,dec,tag,dec_color,conf,today,nday=predict(df,feat,model,scaler)
     print_report(df,feat,p_up,p_dn,dec,tag,dec_color,conf,today,nday,
                  auc,brier,ll,strat_ret,mkt_ret,sharpe,maxdd,acc)
-    plot(df,p_up,p_dn,dec,feat,vp,vi,vs)
+    plot(df,p_up,p_dn,dec,feat,vp,vi,vs,comparison_data=comparison_data)
 
 if __name__=="__main__":
     main(retrain=True)
