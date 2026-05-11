@@ -36,7 +36,6 @@ import joblib, os
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 TICKER        = "FPT"
 START_DATE    = "2020-01-01"
-END_DATE      = datetime.today().strftime("%Y-%m-%d")
 FILE_PATH     = r"d:\ck\FPT_data.csv"   # <-- duong dan file local
 THRESHOLD_BUY  = 0.6
 THRESHOLD_SELL = 0.4
@@ -91,44 +90,45 @@ def add_features(df):
 EXCLUDE={'Target','Open','High','Low','Close','Volume','Adj Close'}
 
 def load_data():
+    """Chỉ đọc dữ liệu từ file CSV local để training."""
     print(f"[*] Doc file local: {FILE_PATH} ...")
     raw = pd.read_csv(FILE_PATH, parse_dates=['Date'])
     raw = raw.sort_values('Date').set_index('Date')
     raw.index.name = 'Date'
-    # Chuan hoa ten cot neu can
     raw.columns = [c.strip().capitalize() for c in raw.columns]
     raw = raw[['Open','High','Low','Close','Volume']].dropna()
-    print(f"    -> {len(raw)} ngay du lieu (local), tu {raw.index[0].date()} den {raw.index[-1].date()}")
-    
-    # Lay du lieu moi nhat tu yfinance cho FPT.VN (neu TICKER la FPT)
-    yf_ticker = f"{TICKER}.VN" if TICKER == "FPT" else TICKER
-    last_date = raw.index[-1]
-    
-    # Tinh toan start date cho yfinance (lay them vai ngay de tranh thieu xot do lech mui gio/ngay nghi)
-    yf_start = (last_date - timedelta(days=5)).strftime("%Y-%m-%d")
-    print(f"[*] Downloading latest data cho {yf_ticker} tu {yf_start} ...")
-    
-    try:
-        raw_new = yf.download(yf_ticker, start=yf_start, progress=False)
-        if not raw_new.empty:
-            raw_new.columns = raw_new.columns.get_level_values(0)
-            raw_new = raw_new[['Open','High','Low','Close','Volume']].dropna()
-            # Loai bo timezone neu co de match voi local data
-            raw_new.index = raw_new.index.tz_localize(None)
-            
-            # Combine 2 dataframe, uu tien du lieu tu yfinance cho cac ngay trung nhau
-            raw = pd.concat([raw[~raw.index.isin(raw_new.index)], raw_new])
-            raw = raw.sort_index()
-            print(f"    -> Cap nhat thanh cong den: {raw.index[-1].date()}")
-        else:
-            print("    -> Khong co du lieu moi tu yfinance.")
-    except Exception as e:
-        print(f"    -> Loi khi lay du lieu yfinance: {e}")
+    print(f"    -> {len(raw)} ngay du lieu (CSV), tu {raw.index[0].date()} den {raw.index[-1].date()}")
 
-    df  = add_features(raw.copy())
+    df   = add_features(raw.copy())
     df.dropna(inplace=True)
     feat = [c for c in df.columns if c not in EXCLUDE]
     return df, df[feat], df['Target'], feat
+
+
+def load_today():
+    """
+    Fetch dữ liệu ngày hôm nay (hoặc ngày giao dịch gần nhất)
+    từ yfinance để dự đoán cho ngày kế tiếp.
+    Trả về DataFrame đã có đầy đủ features (1 hàng cuối = hôm nay).
+    """
+    yf_ticker = f"{TICKER}.VN" if TICKER == "FPT" else TICKER
+    # Lấy ~300 ngày để tính đủ các chỉ báo kỹ thuật cần lookback dài (SMA200, ...)
+    fetch_start = (datetime.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+    try:
+        raw = yf.download(yf_ticker, start=fetch_start, progress=False)
+        if raw.empty:
+            print("    -> Khong lay duoc du lieu hom nay tu yfinance.")
+            return None
+        raw.columns = raw.columns.get_level_values(0)
+        raw = raw[['Open','High','Low','Close','Volume']].dropna()
+        raw.index = raw.index.tz_localize(None)
+        print(f"    -> Du lieu moi nhat: {raw.index[-1].date()}")
+        df_today = add_features(raw.copy())
+        df_today.dropna(inplace=True)
+        return df_today
+    except Exception as e:
+        print(f"    -> Loi khi lay du lieu hom nay: {e}")
+        return None
 
 # ── TRAINING ─────────────────────────────────────────────────────────────────
 def train(df, X, y, feat):
@@ -290,9 +290,8 @@ def compare_methods(X_tr_sc, y_tr, X_val_sc, y_val,
         ("Logistic Reg. + Isotonic Cal.",       r3),
     ]
 
-    # ── Xác định chỉ số tốt nhất ─────────────────────────────────────────────
-    keys_higher = ['auc', 'acc', 'sharpe', 'strat_ret']
-    keys_lower  = ['brier', 'll', 'maxdd']   # maxdd âm → cao hơn = tốt hơn
+    keys_higher = ['auc', 'acc', 'sharpe', 'strat_ret', 'maxdd']
+    keys_lower  = ['brier', 'll']   # maxdd âm → cao hơn = tốt hơn
 
     def is_best(key, val, all_res):
         vals = [r[key] for _, r in all_res]
@@ -366,9 +365,9 @@ def plot_comparison(comparison_data):
     if comparison_data is None:
         return
 
-    DK='#0d1117'; PN='#161b22'; EG='#30363d'
-    BL='#58a6ff'; OR='#f0883e'; PU='#bc8cff'
-    GR='#3fb950'; RD='#f85149'; GY='#8b949e'; WH='#e6edf3'
+    DK='#ffffff'; PN='#ffffff'; EG='#d0d7de'
+    BL='#0969da'; OR='#0969da'; PU='#0969da'
+    GR='#1a7f37'; RD='#d1242f'; GY='#57606a'; WH='#24292f'
     COLORS = [BL, OR, PU]          # màu cho mỗi phương pháp
     STAR   = '★ '
 
@@ -387,11 +386,11 @@ def plot_comparison(comparison_data):
         # (title, key, higher_is_better, unit, y_label)
         ('ROC-AUC',        'auc',       True,  '',   'AUC'),
         ('Accuracy',       'acc',       True,  '%',  'Accuracy (%)'),
-        ('Brier Score',    'brier',     False, '',   'Score (↓ better)'),
         ('Log Loss',       'll',        False, '',   'Loss (↓ better)'),
+        ('Brier Score',    'brier',     False, '',   'Score (↓ better)'),
         ('Sharpe Ratio',   'sharpe',    True,  '',   'Sharpe'),
-        ('Strategy Return','strat_ret', True,  '%',  'Return (%)'),
         ('Max Drawdown',   'maxdd',     True,  '%',  'Drawdown (%)'),
+        ('Strategy Return','strat_ret', True,  '%',  'Return (%)'),
     ]
 
     ncols = 4
@@ -557,7 +556,7 @@ def print_report(df, feat, p_up, p_dn, dec, tag, dec_color, conf, today, nday,
     # ── Header ──────────────────────────────────────────────────────────────
     console.rule("[bold cyan]PROBABILISTIC FORECASTING FOR TRADING DECISIONS[/bold cyan]")
     console.print(f"  Ticker: [bold white]{TICKER}[/]   "
-                  f"Period: [dim]{START_DATE} -> {today}[/]", justify="center")
+                  f"Date: {today}", justify="center")
     console.print()
 
     # ── Signal panel ────────────────────────────────────────────────────────
@@ -677,10 +676,10 @@ def print_report(df, feat, p_up, p_dn, dec, tag, dec_color, conf, today, nday,
     console.rule(style="dim")
 
 # ── DASHBOARD ────────────────────────────────────────────────────────────────
-def plot(df, p_up, p_dn, dec, feat, val_prob=None, val_idx=None, val_sig=None, comparison_data=None):
-    DK='#0d1117'; PN='#161b22'; EG='#30363d'
-    BL='#58a6ff'; OR='#f0883e'; PU='#bc8cff'
-    GR='#3fb950'; RD='#f85149'; GY='#8b949e'; WH='#e6edf3'
+def plot(df, p_up, p_dn, dec, feat, val_prob=None, val_idx=None, val_sig=None, comparison_data=None, df_train=None):
+    DK='#ffffff'; PN='#ffffff'; EG='#d0d7de'
+    BL='#0969da'; OR='#0969da'; PU='#0969da'
+    GR='#1a7f37'; RD='#d1242f'; GY='#57606a'; WH='#24292f'
 
     fig=plt.figure(figsize=(20,13),facecolor=DK)
     fig.suptitle(f'Probabilistic Forecasting for Trading  —  {TICKER}',
@@ -734,8 +733,9 @@ def plot(df, p_up, p_dn, dec, feat, val_prob=None, val_idx=None, val_sig=None, c
 
     # E: Calibration curve
     ax5=fig.add_subplot(gs[1,2]); sty(ax5,'Probability Calibration Curve')
+    _df_cal = df_train if df_train is not None else df
     if val_prob is not None:
-        frac_pos,mean_pred=calibration_curve(df['Target'].iloc[val_idx],val_prob,n_bins=10)
+        frac_pos,mean_pred=calibration_curve(_df_cal['Target'].iloc[val_idx],val_prob,n_bins=10)
         ax5.plot(mean_pred,frac_pos,color=BL,lw=1.4,marker='o',ms=4,label='Model')
         ax5.plot([0,1],[0,1],color=GY,ls='--',lw=1.0,label='Perfect')
         ax5.set_xlim(0,1); ax5.set_ylim(0,1)
@@ -808,10 +808,15 @@ def main(retrain=True):
         vp=vi=vs=None
         auc=brier=ll=strat_ret=mkt_ret=sharpe=maxdd=acc=0.0
 
-    p_up,p_dn,dec,tag,dec_color,conf,today,nday=predict(df,feat,model,scaler)
-    print_report(df,feat,p_up,p_dn,dec,tag,dec_color,conf,today,nday,
+    # Lấy dữ liệu hôm nay từ yfinance để dự đoán
+    df_today = load_today()
+    df_pred  = df_today if df_today is not None else df  # fallback về CSV nếu lỗi
+
+    p_up,p_dn,dec,tag,dec_color,conf,today,nday=predict(df_pred,feat,model,scaler)
+    print_report(df_pred,feat,p_up,p_dn,dec,tag,dec_color,conf,today,nday,
                  auc,brier,ll,strat_ret,mkt_ret,sharpe,maxdd,acc)
-    plot(df,p_up,p_dn,dec,feat,vp,vi,vs,comparison_data=comparison_data)
+    # df_pred = hom nay (de ve chart), df = training data (de ve calibration curve voi val_idx chinh xac)
+    plot(df_pred,p_up,p_dn,dec,feat,vp,vi,vs,comparison_data=comparison_data,df_train=df)
 
 if __name__=="__main__":
     main(retrain=True)
